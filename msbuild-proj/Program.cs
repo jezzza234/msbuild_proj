@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace msbuild_proj
 {
@@ -47,6 +48,20 @@ namespace msbuild_proj
                     break;
                 }
                 break;
+              case "nuget":
+                switch (args[1])
+                {
+                  case "prepare":
+                    CreateNugetPackage(args[2], args[3], args[4]);
+                    break;
+                  case "add":
+                    AddNugetPackageToProject(args[2], args[3], args[4]);
+                    break;
+                  default:
+                    Help();
+                    break;
+                }
+                break;
               case "gitignore":
                 CreateGitIgnore();
                 break;
@@ -56,6 +71,138 @@ namespace msbuild_proj
           }
           
         }
+
+      private static void AddNugetPackageToProject(string packageName, string packageVersion, string projectName)
+      {
+        var currentDir = Environment.CurrentDirectory;
+        var projectDir = Path.Combine(currentDir, projectName);
+        var projectFilePath = Path.Combine(projectDir, projectName + ".csproj");
+        var packageAssemblyLocation =
+          Path.Combine(
+            Path.Combine(Path.Combine(Path.Combine(currentDir, "packages"), packageName + "." + packageVersion), "lib"),
+            "net45");
+        string projectFileContents;
+        using (var reader = new StreamReader(projectFilePath))
+        {
+          projectFileContents = reader.ReadToEnd();
+        }
+        var dlls = Directory.GetFiles(packageAssemblyLocation, "*.dll");
+        var indexOfReferenceInclude = projectFileContents.IndexOf("<Reference Include");
+        var sb = new StringBuilder();
+        foreach (var dll in dlls)
+        {
+          var dllReferenceContents = GetDllReferenceContents(dll, packageName, packageVersion);
+          sb.AppendLine(dllReferenceContents);
+        }
+        var dllReferenceContentsToAdd = sb.ToString();
+        projectFileContents = projectFileContents.Insert(indexOfReferenceInclude, sb.ToString());
+        using (var writer = new StreamWriter(projectFilePath, false))
+        {
+          writer.Write(projectFileContents);
+        }
+        
+        Console.WriteLine("Added Nuget package to project");
+      }
+
+      private static string GetDllReferenceContents(string dllFile, string packageName, string packageVersion)
+      {
+        var assembly = Assembly.LoadFile(dllFile);
+        var assemblyFullName = assembly.FullName;
+        var currentDir = Environment.CurrentDirectory;
+        var strippedOutFilePath = ".." + dllFile.Replace(currentDir, string.Empty);
+        strippedOutFilePath = strippedOutFilePath.Replace("/", "\\");
+        return string.Format(System.Globalization.CultureInfo.InvariantCulture,
+          @"<Reference Include=""{0}"">
+          <HintPath>{1}</HintPath>
+          <EmbedInteropTypes>False</EmbedInteropTypes>
+          </Reference>",
+          assemblyFullName,
+          strippedOutFilePath);
+      }
+
+      private static void CreateNugetPackage(string packageName, string packageVersion, string projectName)
+      {
+        var currentDir = Environment.CurrentDirectory;
+        var projectDir = Path.Combine(currentDir, projectName);
+        var projectFilePath = Path.Combine(projectDir, projectName + ".csproj");
+        var packagesConfig = Path.Combine(projectDir, "packages.config");
+        string onlyPackageContents;
+        var nugetPackageConfigContents = GetNugetPackageConfigContents(packageName, packageVersion, out onlyPackageContents);
+        bool fileExists = false;
+        bool writeFile = true;
+        if (File.Exists(packagesConfig))
+        {
+          string existingContents;
+          using (var sr = new StreamReader(packagesConfig))
+          {
+            existingContents = sr.ReadToEnd();
+          }
+          if (existingContents.Contains(onlyPackageContents))
+          {
+            Console.WriteLine("An existing packages.config already exists within the specified project for the specified package, doing nothing");
+            writeFile = false;
+          }
+          else
+          {
+            var indexOfEnd = existingContents.IndexOf("</packages>");
+            nugetPackageConfigContents = existingContents.Insert(indexOfEnd, onlyPackageContents + "\n");
+
+            fileExists = true;  
+          }
+        }
+
+        if (writeFile)
+        {
+          using (var writer = new StreamWriter(packagesConfig, !fileExists))
+          {
+            writer.Write(nugetPackageConfigContents);
+          }
+        }
+
+        //add reference to new config file to project file
+        string projContents;
+        using (var sr = new StreamReader(projectFilePath))
+        {
+          projContents = sr.ReadToEnd();
+        }
+        if (projContents.Contains("packages.config"))
+        {
+          Console.WriteLine("Project already contains a reference to the package, doing nothing");
+          return;
+        }
+        var lastIndexOfItemGroup = projContents.LastIndexOf("</ItemGroup>");
+        var nugetPackageProjectIncludeContents = GetNugetPackageProjectIncludeContents();
+        projContents = projContents.Insert(lastIndexOfItemGroup + 12, "\n" + nugetPackageProjectIncludeContents);
+        using (var writer = new StreamWriter(projectFilePath, false))
+        {
+          writer.Write(projContents);
+        }
+        
+        Console.WriteLine("Prepared Nuget package");
+        Console.WriteLine("Now run [nuget restore <solutionFile>] to download the assemblies");
+        Console.WriteLine("After that you can invoke [msbuild_proj nuget add <packageName> <packageVersion> <project>] to add a reference to it");
+      }
+
+      private static object GetNugetPackageProjectIncludeContents()
+      {
+        return @"<ItemGroup>
+    <None Include=""packages.config"" />
+          </ItemGroup>";
+      }
+
+      private static string GetNugetPackageConfigContents(string packageName, string packageVersion, out string onlyPackageContents)
+      {
+        onlyPackageContents = string.Format(System.Globalization.CultureInfo.InvariantCulture,
+          @"<package id=""{0}"" version=""{1}"" targetFramework=""net452"" />",
+          packageName, packageVersion);
+        
+        return string.Format(System.Globalization.CultureInfo.InvariantCulture,
+          @"<?xml version=""1.0"" encoding=""utf-8""?>
+          <packages>
+          {2}
+          </packages>",
+          packageName, packageVersion, onlyPackageContents);
+      }
 
       private static void AddProjectToSolution(string s)
       {
@@ -77,6 +224,8 @@ namespace msbuild_proj
         {
           write.Write(gitIgnoreFileContents);
         }
+        
+        Console.WriteLine("Created .gitignore");
       }
 
       private static void Help()
@@ -88,6 +237,10 @@ namespace msbuild_proj
         Console.WriteLine("\t\t> Creates a new class library project with the name of <proj>\n");
         Console.WriteLine("add <proj>");
         Console.WriteLine("\t\t> Adds the specified project to the current project\n");
+        Console.WriteLine("nuget prepare <packageName> <packageVersion> <projectName>");
+        Console.WriteLine("\t\t> Creates a packages.config and adds it to the project\n");
+        Console.WriteLine("nuget add <packageName> <packageVersion> <projectName>");
+        Console.WriteLine("\t\t> Adds a reference to the specific package to the specified project\n");
         Console.WriteLine("gitignore");
         Console.WriteLine("\t\t> Creates a new .gitignore file with the default .Net ignores");
       }
@@ -122,6 +275,8 @@ namespace msbuild_proj
         {
           writer.Write(projContents);
         }
+        
+        Console.WriteLine("Added project reference to project");
       }
 
       private static string GetProjectReferenceContents(string projName, string projGuid)
